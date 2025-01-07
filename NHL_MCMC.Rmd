@@ -1,0 +1,829 @@
+---
+title: "NHL - Markov Chain"
+author: "Anurag"
+date: "2024-09-24"
+output: html_document
+---
+
+# Project NHL MCMC Simulation
+
+## 1. Loading Required Libraries
+
+```{r setup, include=TRUE}
+library(hockeyR)
+library(tidyverse)
+library(sportyR)
+library(dplyr)
+library(markovchain)
+library(openxlsx)
+library(stringr)
+library(ggplot2)
+library(tidyr)
+library(scales)
+library(ggthemes)
+library(plotly)
+```
+
+## 2. Data Preparation
+
+### Reading 2022-23 Season Play-by-Play NHL Games
+
+```{r}
+NHL_2023 <- load_pbp(2023)
+
+NHL_2023 <- NHL_2023 |>
+  mutate(points_outcome = ifelse(event == 'Goal', 1, 0))
+```
+
+## 3. Function Definitions
+
+### Add_PossessionRetained Function
+
+```{r}
+Add_PossesionRetained <- function(Data) {
+  df_test <- Data |>
+    add_column(PossessionRetained = 0) |>
+    select(game_id, event_id, event_team_abbr, event, description, PossessionRetained, points_outcome,
+           home_abbreviation, away_abbreviation, ordinal_num, home_score, away_score,
+           event_player_1_name, event_player_1_type, event_player_2_name, event_player_2_type,
+           event_player_3_name, event_player_3_type, period_seconds, period_time, x, y, x_fixed, y_fixed,
+           shot_distance, shot_angle, date_time) 
+  
+  df1 <- df_test |>
+    mutate(PossessionRetained = case_when(
+      event %in% c('Faceoff', 'Takeaway') ~ 1,  # Possession retained
+      event %in% c('Giveaway', 'Penalty', 'Goal') ~ 0,  # Possession lost
+      TRUE ~ NA_real_  # Handle other cases with NA or a default value
+    ))
+  
+  # Create a shifted version of event_team_abbr and event for the next row
+  df1 <- df1 |>
+    mutate(next_event_team_abbr = lead(event_team_abbr),
+           next_event = lead(event))
+  
+  # Update PossessionRetained based on the next event using vectorized conditions
+  df1 <- df1 |>
+    mutate(PossessionRetained = case_when(
+      event %in% c('Blocked Shot', 'Shot', 'Missed Shot', 'Hit') ~ 
+        case_when(
+          is.na(next_event_team_abbr) ~ 0,  # Default to 0 if next_event_team_abbr is NA
+          next_event_team_abbr == event_team_abbr ~
+            case_when(
+              next_event %in% c("Missed Shot", "Shot", "Goal", "Giveaway", 
+                                "Failed Shot Attempt", "Blocked Shot", "Penalty") ~ 1,
+              next_event %in% c("Hit", "Faceoff", "Takeaway",
+                                "Period End") ~ 0,
+              TRUE ~ NA_real_
+            ),
+          next_event_team_abbr != event_team_abbr ~
+            case_when(
+              next_event %in% c("Missed Shot", "Shot", "Goal", "Giveaway", 
+                                "Failed Shot Attempt", "Period End", "Blocked Shot",
+                                "Faceoff") ~ 0,
+              next_event %in% c("Hit", "Takeaway", "Penalty") ~ 1,
+              TRUE ~ NA_real_
+            ),
+          TRUE ~ NA_real_
+        ),
+      TRUE ~ PossessionRetained
+    ))
+  
+  # Clean up temporary columns
+  df1 <- df1 |>
+    select(-next_event_team_abbr, -next_event)
+  
+  return(df1)
+}
+```
+
+### Markov Chain Cleansing Function
+
+```{r}
+markov_chain_cleansing <- function(data, team){
+  df <- data
+  concat_df <- paste(df$event_team_abbr, df$event, df$PossessionRetained, df$points_outcome, sep = ';')
+  markov_chain_matrix <- markovchainFit(concat_df)$estimate@transitionMatrix
+
+  row_names <- rownames(markov_chain_matrix)
+  col_names <- colnames(markov_chain_matrix)
+
+  first_part_rows <- sapply(str_split(row_names, ";"), "[", 1)
+  first_part_cols <- sapply(str_split(col_names, ";"), "[", 1)
+
+  row_index <- which(first_part_rows == team)
+  col_index <- which(first_part_cols == team)
+
+  markov_chain_matrix_cleansed <- markov_chain_matrix[row_index, col_index]
+
+  return(markov_chain_matrix_cleansed)
+}
+```
+
+### Home Team Markov Matrices Function
+
+```{r}
+Home_team_markov_matrices <- function(data, team) {
+  # Filter the data for the specified home team
+  Home_team_data <- data |> 
+    filter(home_abbreviation == team)
+  
+  # Split the data by game_id
+  split_data <- split(Home_team_data, Home_team_data$game_id)
+  
+  # Apply the markov_chain_cleansing function to each game
+  markov_chain_list <- lapply(split_data, function(game_data) {
+    markov_chain_cleansing(game_data, team)
+  })
+  
+  return(markov_chain_list)
+}
+
+```
+
+### Away Team Markov Matrices Function
+
+```{r}
+Away_team_markov_matrices <- function(data, team) {
+  # Filter the data for the specified away team
+  Away_team_data <- data |> 
+    filter(away_abbreviation == team)
+  
+  # Split the data by game_id
+  split_data <- split(Away_team_data, Away_team_data$game_id)
+  
+  # Apply the markov_chain_cleansing function to each game
+  markov_chain_list <- lapply(split_data, function(game_data) {
+    markov_chain_cleansing(game_data, team)
+  })
+  
+  return(markov_chain_list)
+}
+
+```
+
+### Master Markov Matrix Simplification Function
+
+```{r}
+simplify_matrix <- function(markov_chain_matrices){
+  xx <- markov_chain_matrices[as.logical(rowSums(markov_chain_matrices != 0, na.rm = TRUE)), ]
+  xx <- xx[, as.logical(colSums(xx != 0, na.rm = TRUE))]
+  return(xx)
+}
+```
+
+### Extract Game Dates Function
+
+```{r}
+home_team_game_dates <- function(data, team) {
+  # Filter the data for the specified home team and first period
+  Home_team_data <- data |> 
+    filter(home_abbreviation == team, ordinal_num == '1st')
+  
+  Home_team_data <- Home_team_data |>
+    mutate(date_only = as.Date(date_time)) |>
+    select(game_id, date_only) |>
+    group_by(game_id)
+  
+  return(unique(Home_team_data$date_only))
+}
+
+away_team_game_dates <- function(data, team) {
+  # Filter the data for the specified away team and first period
+  Away_team_data <- data |> 
+    filter(away_abbreviation == team, ordinal_num == '1st')
+  
+  Away_team_data <- Away_team_data |>
+    mutate(date_only = as.Date(date_time)) |>
+    select(game_id, date_only) |>
+    group_by(game_id)
+  
+  return(unique(Away_team_data$date_only))
+}
+```
+
+### Simulation Function
+
+```{r}
+ss <- function(home_final_markov_chain, away_final_markov_chain, home_final_table, away_final_table, away_team, home_team){
+  
+  simulated_final_game <- data.frame(
+    home_team = character(),
+    away_team = character(),
+    event_team = character(),
+    event = character(),
+    PossessionRetained = integer(),
+    points_outcome = integer(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Function to select and add a faceoff play
+  add_faceoff <- function(sim_game, home_table, away_table, home_team, away_team){
+    options <- c('home','away')
+    select_faceoff_team <- sample(options, 1)
+    if(select_faceoff_team == 'home'){
+      faceoff_row <- home_table[grepl("faceoff", home_table$column_name, ignore.case = TRUE), ]
+      first_play_parsed <- c(home_team, away_team, 
+                             unlist(str_split(as.character(faceoff_row$column_name), ';')))
+    }
+    else{
+      faceoff_row <- away_table[grepl("faceoff", away_table$column_name, ignore.case = TRUE), ]
+      first_play_parsed <- c(home_team, away_team, 
+                             unlist(str_split(as.character(faceoff_row$column_name), ';')))
+    }
+    if(length(first_play_parsed) != ncol(sim_game)){
+      stop("Mismatch in first_play_parsed length")
+    }
+    first_play_df <- t(as.data.frame(first_play_parsed, stringsAsFactors = FALSE))
+    colnames(first_play_df) <- colnames(sim_game)
+    rownames(first_play_df) <- NULL
+    sim_game <- rbind(sim_game, first_play_df)
+    return(sim_game)
+  }
+  
+  # Initialize the game with a faceoff
+  simulated_final_game <- add_faceoff(simulated_final_game, home_final_table, away_final_table,
+                                      home_team, away_team)
+  
+  while (nrow(simulated_final_game) <= 200) {
+    # Find last row
+    last_row <- simulated_final_game[nrow(simulated_final_game), ]
+    
+    # Check if the last event was a goal
+    if(tolower(last_row$event) == "goal"){
+      # Start from faceoff
+      simulated_final_game <- add_faceoff(simulated_final_game, home_final_table,
+                                          away_final_table, home_team, away_team)
+      
+      # Proceed to next iteration
+      next
+    }
+    
+    # Concatenate the relevant columns to form the state
+    last_row_concatenated <- paste(as.character(last_row[3:ncol(last_row)]), sep=';', 
+                                   collapse = ';')
+    
+    # Determine the next play based on possession and event team
+    if(last_row$PossessionRetained == 1 & last_row$event_team == home_team){
+      # Home team retains possession
+      markov_chain <- home_final_markov_chain
+      current_markov <- "home"
+    } 
+    else if(last_row$PossessionRetained == 0 & last_row$event_team == home_team) {
+      # Possession changes to away team
+      current_table <- away_final_table
+    }
+    else if(last_row$PossessionRetained == 1 & last_row$event_team == away_team) {
+      # Away team retains possession
+      markov_chain <- away_final_markov_chain
+      current_markov <- "away"
+    } 
+    else if(last_row$PossessionRetained == 0 & last_row$event_team == away_team) {
+      # Possession changes to home team
+      current_table <- home_final_table
+    }
+    
+    # Proceed only if last event was not a goal
+    if(tolower(last_row$event) != "goal"){
+      if(last_row$PossessionRetained == 1){
+        # Find probability of the next event from the current markov chain
+        row_to_inspect <- which(rownames(markov_chain) == last_row_concatenated)
+        if(length(row_to_inspect) == 0){
+          stop(paste("State not found in", current_markov, "markov chain:", last_row_concatenated))
+        }
+        options_to_inspect <- as.data.frame(markov_chain[row_to_inspect, ], stringsAsFactors = FALSE)
+        options_to_inspect <- options_to_inspect[which(markov_chain[row_to_inspect, ] > 0), , drop = FALSE]
+        colnames(options_to_inspect) <- c('freq')
+        options_to_inspect$prob <- options_to_inspect$freq / sum(options_to_inspect$freq)
+        options_to_inspect <- options_to_inspect[order(-options_to_inspect$prob), ]
+        options_to_inspect$cumprob <- round(cumsum(options_to_inspect$prob), 6)
+        
+        # Randomly select next play
+        next_play <- runif(1)
+        selected_state <- rownames(options_to_inspect)[min(which(options_to_inspect$cumprob >= next_play))]
+        next_play_parsed <- c(home_team, away_team, unlist(str_split(as.character(selected_state), ';')))
+        
+        # Add the selected play to the simulation
+        next_play_df <- t(as.data.frame(next_play_parsed, stringsAsFactors = FALSE))
+        colnames(next_play_df) <- colnames(simulated_final_game)
+        rownames(next_play_df) <- NULL
+        simulated_final_game <- rbind(simulated_final_game, next_play_df)
+      } 
+      else {
+        # Possession changes to the opponent team
+        # Select next play based on the opponent's table cumulative probabilities
+        next_play <- runif(1)
+        selected_row <- which(next_play <= current_table$cumprob)[1]
+        if(is.na(selected_row)){
+          stop("No valid play found for the opponent's cumulative probability.")
+        }
+        next_play_parsed <- c(home_team, away_team, unlist(str_split(as.character(current_table$column_name[selected_row]), ';')))
+        
+        # Add the selected play to the simulation
+        next_play_df <- t(as.data.frame(next_play_parsed, stringsAsFactors = FALSE))
+        colnames(next_play_df) <- colnames(simulated_final_game)
+        rownames(next_play_df) <- NULL
+        simulated_final_game <- rbind(simulated_final_game, next_play_df)
+      }
+    }
+  }
+  
+  Home_Shots_taken <- simulated_final_game |>
+    filter(event_team == home_team & 
+             event %in% c("Shot", "Missed Shot", "Blocked Shot", "Goal"))
+  Away_Shots_taken <- simulated_final_game |>
+    filter(event_team == away_team & 
+             event %in% c("Shot", "Missed Shot", "Blocked Shot", "Goal"))
+  
+  Home_goals <- sum(as.numeric(simulated_final_game$points_outcome[
+    which(simulated_final_game$event_team == home_team)]))
+  Away_goals <- sum(as.numeric(simulated_final_game$points_outcome[
+    which(simulated_final_game$event_team == away_team)]))
+          
+  goal_diff <- Home_goals - Away_goals
+  
+  # Return Data frame 
+  return(data.frame(
+  goal_diff = goal_diff,
+  Home_goals = Home_goals,
+  Away_goals = Away_goals,
+  Home_shots = nrow(Home_Shots_taken),
+  Away_shots = nrow(Away_Shots_taken),
+  stringsAsFactors = FALSE
+))
+  
+}
+```
+
+### Results Data Frame Function
+
+```{r}
+Results_df <- function(result, n) {
+  results_df <- bind_rows(result)
+  results_df <- results_df %>%
+    mutate(simulation = 1:n)
+  results_df <- results_df %>%
+    select(simulation, everything())
+  return(results_df)
+}
+```
+
+## 4. Function Calls for Home and Away Teams
+
+### Define Home and Away Teams
+
+```{r}
+home_team <- 'EDM'
+away_team <- 'VGK'
+```
+
+### Filter Events to Keep
+
+```{r}
+events_to_keep <- c(
+  "Faceoff", "Hit", "Shot", "Missed Shot", 
+  "Giveaway", "Blocked Shot", "Goal", 
+  "Takeaway", "Penalty", "Failed Shot Attempt"
+)
+NHL_2023 <- NHL_2023 |> filter(event %in% events_to_keep)
+
+NHL_2023_Possessions <- Add_PossesionRetained(NHL_2023)
+NHL_2023_Possessions <- NHL_2023_Possessions |>
+  filter(!is.na(PossessionRetained))
+
+```
+
+### Generate Markov Chain Matrices for Home and Away Teams
+
+```{r}
+Home_team_markov_matrices <- Home_team_markov_matrices(NHL_2023_Possessions, home_team)
+Away_team_markov_matrices <- Away_team_markov_matrices(NHL_2023_Possessions, away_team)
+```
+
+### Simplify Markov Chain Matrices
+
+```{r}
+Home_team_markov_matrices <- lapply(Home_team_markov_matrices, simplify_matrix)
+Away_team_markov_matrices <- lapply(Away_team_markov_matrices, simplify_matrix)
+```
+
+## 5. Home and Away Team Analysis
+
+### Home Team Analysis
+
+```{r}
+# Combine Home Team Markov Chains into One Master Matrix
+
+chome <- unique(unlist(lapply(Home_team_markov_matrices, colnames)))
+rhome <- unique(unlist(lapply(Home_team_markov_matrices, rownames)))
+
+temp_home_master_markov <- matrix(0, nrow = length(rhome), ncol = length(chome), 
+                                  dimnames = list(rhome, chome))
+home_master_markov <- rep(list(temp_home_master_markov), length(Home_team_markov_matrices))
+
+# Assign Weights Inversely Proportional to Date of the Game
+today <- Sys.Date()
+home_team_game_dates <- home_team_game_dates(NHL_2023_Possessions, home_team)
+home_team_game_weights <- exp(as.numeric(home_team_game_dates - today)) / sum(exp(as.numeric(home_team_game_dates - today)))
+
+# Apply Weights to Each Markov Matrix
+for (element in 1:length(home_master_markov)) {
+  for (row in 1:nrow(Home_team_markov_matrices[[element]])) {
+    row_name <- rownames(Home_team_markov_matrices[[element]])[row]
+    column_names <- names(which(Home_team_markov_matrices[[element]][row,] != 0))
+    for (column in 1:length(column_names)) {
+      home_master_markov[[element]][which(rownames(home_master_markov[[element]])==row_name)
+                                    ,which(colnames(home_master_markov[[element]])==column_names[column])] <-
+        Home_team_markov_matrices[[element]][row,which(colnames(Home_team_markov_matrices[[element]])==column_names[column])] * home_team_game_weights[element] 
+      
+    }
+    
+  }
+  
+}
+
+# Create Final Home Markov Chain Matrix
+home_final_markov_chain <- Reduce("+", home_master_markov)
+
+home_final_markov_chain <- simplify_matrix(home_final_markov_chain)
+
+# Create Home Final Table
+all_home_colnames <- unlist(lapply(Home_team_markov_matrices, rownames))
+home_colnames_df <- data.frame(column_name = all_home_colnames, stringsAsFactors = FALSE)
+
+home_final_table <- home_colnames_df |>
+  count(column_name, name = "freq") 
+home_final_table <- home_final_table[home_final_table$column_name %in% rownames(home_final_markov_chain), ]
+home_final_table <- home_final_table |>
+  arrange(desc(freq)) |>
+  mutate(prob = freq / sum(freq),
+         cumprob = cumsum(prob))
+
+```
+
+### Away Team Analysis
+
+```{r}
+# Combine Away Team Markov Chains into One Master Matrix
+
+caway <- unique(unlist(lapply(Away_team_markov_matrices, colnames)))
+raway <- unique(unlist(lapply(Away_team_markov_matrices, rownames)))
+
+temp_away_master_markov <- matrix(0, nrow = length(raway), ncol = length(caway), 
+                                  dimnames = list(raway, caway))
+away_master_markov <- rep(list(temp_away_master_markov), length(Away_team_markov_matrices))
+
+# Assign Weights Inversely Proportional to Date of the Game
+away_team_game_dates <- away_team_game_dates(NHL_2023_Possessions, away_team)
+away_team_game_weights <- exp(as.numeric(away_team_game_dates - today)) / sum(exp(as.numeric(away_team_game_dates - today)))
+
+# Apply Weights to Each Markov Matrix
+for (element in 1:length(away_master_markov)) {
+  for (row in 1:nrow(Away_team_markov_matrices[[element]])) {
+    row_name <- rownames(Away_team_markov_matrices[[element]])[row]
+    column_names <- names(which(Away_team_markov_matrices[[element]][row, ] != 0))
+    for (column in 1:length(column_names)) { 
+      away_master_markov[[element]][which(rownames(away_master_markov[[element]]) == row_name),
+                                      which(colnames(away_master_markov[[element]]) == column_names[column])] <-
+        Away_team_markov_matrices[[element]][row, which(colnames(Away_team_markov_matrices[[element]]) == column_names[column])] * away_team_game_weights[element] 
+    }
+  }
+}
+
+# Create Final Away Markov Chain Matrix
+away_final_markov_chain <- Reduce("+", away_master_markov)
+
+away_final_markov_chain <- simplify_matrix(away_final_markov_chain)
+
+# Create Away Final Table
+all_away_colnames <- unlist(lapply(Away_team_markov_matrices, rownames))
+away_colnames_df <- data.frame(column_name = all_away_colnames, stringsAsFactors = FALSE)
+
+away_final_table <- away_colnames_df |>
+  count(column_name, name = "freq") 
+away_final_table <- away_final_table[away_final_table$column_name %in% rownames(away_final_markov_chain), ]
+away_final_table <- away_final_table |>
+  arrange(desc(freq)) |>
+  mutate(prob = freq / sum(freq),
+         cumprob = cumsum(prob))
+
+```
+
+## 6. Simulations
+
+### Simulation Function Execution (After Goal: Faceoff)
+
+### Note: The simulation function 'ss' is defined above and used in simulations.
+
+### Simulation 100x
+
+```{r}
+results_list <- replicate(
+  n = 100,
+  expr = ss(
+    home_final_markov_chain = home_final_markov_chain,
+    away_final_markov_chain = away_final_markov_chain,
+    home_final_table = home_final_table,
+    away_final_table = away_final_table,
+    away_team = away_team,
+    home_team = home_team
+  ),
+  simplify = FALSE
+)
+
+Result_100 <- Results_df(results_list, 100)
+
+Result_100 <- Result_100 |>
+  mutate(result = ifelse(goal_diff > 0, 'win',
+                         ifelse(goal_diff == 0, 'tie', 'loss')))
+
+data_100 <- Result_100
+
+# 1. Distribution of Goal Difference
+ggplot(data_100, aes(x = goal_diff)) +
+  geom_histogram(binwidth = 1, fill = "saddlebrown", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Goal Difference - 100x (EDM vs VGK)",
+       x = "Goal Difference",
+       y = "Frequency") +
+  theme_classic()
+
+# 2. Pie Chart for Result Variable
+result_table <- data_100 %>% 
+  count(result) %>% 
+  mutate(percentage = n / sum(n))
+
+brown_palette <- c("win" = "#8B4513",   # SaddleBrown
+                   "tie" = "#A0522D",   # Sienna
+                   "loss" = "#D2B48C")  # Tan
+
+ggplot(result_table, aes(x = "", y = percentage, fill = as.factor(result))) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  scale_y_continuous(labels = percent) +
+  geom_text(aes(label = scales::percent(percentage, accuracy = 0.1)), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", 
+            size = 5) +
+  scale_fill_manual(values = brown_palette) +
+  labs(title = "Pie Chart of Results - 100x",
+       fill = "Result") +
+  theme_classic() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid  = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  )
+
+# 3. Shot Conversion Rate Bar Chart
+conversion_rates <- data_100 %>%
+  summarise(
+    Home_Conversion = mean(Home_goals) / mean(Home_shots),
+    Away_Conversion = mean(Away_goals) / mean(Away_shots)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Team", values_to = "ConversionRate")
+
+brown_palette_conversion <- c("Home_Conversion" = "#8B4513",   # SaddleBrown
+                               "Away_Conversion" = "#D2B48C")  # Tan
+
+ggplot(conversion_rates, aes(x = Team, y = ConversionRate, fill = Team)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = scales::percent(ConversionRate, accuracy = 0.01)), vjust = -0.5) +
+  labs(title = "Shot Conversion Rate for Home and Away Teams - 100x",
+       x = "Team",
+       y = "Conversion Rate") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  scale_fill_manual(values = brown_palette_conversion) +  # Apply the custom brown palette
+  theme_classic()
+
+```
+
+### Simulation 500x
+
+```{r}
+results_list_500 <- replicate(
+  n = 500,
+  expr = ss(
+    home_final_markov_chain = home_final_markov_chain,
+    away_final_markov_chain = away_final_markov_chain,
+    home_final_table = home_final_table,
+    away_final_table = away_final_table,
+    away_team = away_team,
+    home_team = home_team
+  ),
+  simplify = FALSE
+)
+
+Result_500 <- Results_df(results_list_500, 500)
+
+Result_500 <- Result_500 |>
+  mutate(result = ifelse(goal_diff > 0, 'win',
+                         ifelse(goal_diff == 0, 'tie', 'loss')))
+
+data_500 <- Result_500
+
+# 1. Distribution of Goal Difference
+ggplot(data_500, aes(x = goal_diff)) +
+  geom_histogram(binwidth = 1, fill = "saddlebrown", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Goal Difference - 500x (EDM vs VGK)",
+       x = "Goal Difference",
+       y = "Frequency") +
+  theme_classic()
+
+# 2. Pie Chart for Result Variable
+result_table <- data_500 %>% 
+  count(result) %>% 
+  mutate(percentage = n / sum(n))
+
+ggplot(result_table, aes(x = "", y = percentage, fill = as.factor(result))) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  scale_y_continuous(labels = percent) +
+  geom_text(aes(label = scales::percent(percentage, accuracy = 0.1)), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", 
+            size = 5) +
+  scale_fill_manual(values = brown_palette) +
+  labs(title = "Pie Chart of Results - 500x",
+       fill = "Result") +
+  theme_classic() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid  = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  )
+
+# 3. Shot Conversion Rate Bar Chart
+conversion_rates <- data_500 %>%
+  summarise(
+    Home_Conversion = mean(Home_goals) / mean(Home_shots),
+    Away_Conversion = mean(Away_goals) / mean(Away_shots)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Team", values_to = "ConversionRate")
+
+ggplot(conversion_rates, aes(x = Team, y = ConversionRate, fill = Team)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = scales::percent(ConversionRate, accuracy = 0.01)), vjust = -0.5) +
+  labs(title = "Shot Conversion Rate for Home and Away Teams - 500x",
+       x = "Team",
+       y = "Conversion Rate") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  scale_fill_manual(values = brown_palette_conversion) +  # Apply the custom brown palette
+  theme_classic()
+
+```
+
+### Simulation 1000x
+
+```{r}
+results_list_1000 <- replicate(
+  n = 1000,
+  expr = ss(
+    home_final_markov_chain = home_final_markov_chain,
+    away_final_markov_chain = away_final_markov_chain,
+    home_final_table = home_final_table,
+    away_final_table = away_final_table,
+    away_team = away_team,
+    home_team = home_team
+  ),
+  simplify = FALSE
+)
+
+Result_1000 <- Results_df(results_list_1000, 1000)
+
+Result_1000 <- Result_1000 |>
+  mutate(result = ifelse(goal_diff > 0, 'win',
+                         ifelse(goal_diff == 0, 'tie', 'loss')))
+
+data_1000 <- Result_1000
+
+# 1. Distribution of Goal Difference
+ggplot(data_1000, aes(x = goal_diff)) +
+  geom_histogram(binwidth = 1, fill = "saddlebrown", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Goal Difference - 1000x (EDM vs VGK)",
+       x = "Goal Difference",
+       y = "Frequency") +
+  theme_classic()
+
+# 2. Pie Chart for Result Variable
+result_table <- data_1000 %>% 
+  count(result) %>% 
+  mutate(percentage = n / sum(n))
+
+ggplot(result_table, aes(x = "", y = percentage, fill = as.factor(result))) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  scale_y_continuous(labels = percent) +
+  geom_text(aes(label = scales::percent(percentage, accuracy = 0.1)), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", 
+            size = 5) +
+  scale_fill_manual(values = brown_palette) +
+  labs(title = "Pie Chart of Results - 1000x",
+       fill = "Result") +
+  theme_classic() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid  = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  )
+
+# 3. Shot Conversion Rate Bar Chart
+conversion_rates <- data_1000 %>%
+  summarise(
+    Home_Conversion = mean(Home_goals) / mean(Home_shots),
+    Away_Conversion = mean(Away_goals) / mean(Away_shots)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Team", values_to = "ConversionRate")
+
+ggplot(conversion_rates, aes(x = Team, y = ConversionRate, fill = Team)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = scales::percent(ConversionRate, accuracy = 0.01)), vjust = -0.5) +
+  labs(title = "Shot Conversion Rate for Home and Away Teams - 1000x",
+       x = "Team",
+       y = "Conversion Rate") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  scale_fill_manual(values = brown_palette_conversion) +  # Apply the custom brown palette
+  theme_classic()
+
+```
+
+### Simulation 5000x
+
+```{r}
+results_list_5000 <- replicate(
+  n = 5000,
+  expr = ss(
+    home_final_markov_chain = home_final_markov_chain,
+    away_final_markov_chain = away_final_markov_chain,
+    home_final_table = home_final_table,
+    away_final_table = away_final_table,
+    away_team = away_team,
+    home_team = home_team
+  ),
+  simplify = FALSE
+)
+
+Result_5000 <- Results_df(results_list_5000, 5000)
+
+Result_5000 <- Result_5000 |>
+  mutate(result = ifelse(goal_diff > 0, 'win',
+                         ifelse(goal_diff == 0, 'tie', 'loss')))
+
+data_5000 <- Result_5000
+
+# 1. Distribution of Goal Difference
+ggplot(data_5000, aes(x = goal_diff)) +
+  geom_histogram(binwidth = 1, fill = "saddlebrown", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Goal Difference - 5000x (EDM vs VGK)",
+       x = "Goal Difference",
+       y = "Frequency") +
+  theme_classic()
+
+# 2. Pie Chart for Result Variable
+result_table <- data_5000 %>% 
+  count(result) %>% 
+  mutate(percentage = n / sum(n))
+
+ggplot(result_table, aes(x = "", y = percentage, fill = as.factor(result))) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  scale_y_continuous(labels = percent) +
+  geom_text(aes(label = scales::percent(percentage, accuracy = 0.1)), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", 
+            size = 5) +
+  scale_fill_manual(values = brown_palette) +
+  labs(title = "Pie Chart of Results - 5000x",
+       fill = "Result") +
+  theme_classic() +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid  = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+  )
+
+# 3. Shot Conversion Rate Bar Chart
+conversion_rates <- data_5000 %>%
+  summarise(
+    Home_Conversion = mean(Home_goals) / mean(Home_shots),
+    Away_Conversion = mean(Away_goals) / mean(Away_shots)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Team", values_to = "ConversionRate")
+
+ggplot(conversion_rates, aes(x = Team, y = ConversionRate, fill = Team)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = scales::percent(ConversionRate, accuracy = 0.01)), vjust = -0.5) +
+  labs(title = "Shot Conversion Rate for Home and Away Teams - 5000x",
+       x = "Team",
+       y = "Conversion Rate") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01)) +
+  scale_fill_manual(values = brown_palette_conversion) +  # Apply the custom brown palette
+  theme_classic()
+```
